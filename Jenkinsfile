@@ -4,23 +4,22 @@ pipeline {
 
     options {
         timestamps()
-        disableConcurrentBuilds()
         skipDefaultCheckout(true)
+        disableConcurrentBuilds()
     }
 
     environment {
         AWS_REGION = 'ap-south-1'
-        PROJECT = 'microdev'
-
-        // Replace with Terraform's EC2 public IP.
-        EC2_HOST = '13.233.119.105'
+        DEPLOY_DIR = '/var/lib/jenkins/microdev-deploy'
     }
 
     stages {
 
         stage('Checkout Source') {
             steps {
-                checkout scm
+                git branch: 'develop',
+                    credentialsId: 'github-credentials',
+                    url: 'https://github.com/prasadA7989/microservices-task.git'
             }
         }
 
@@ -32,8 +31,7 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    env.IMAGE_TAG =
-                        "${env.BUILD_NUMBER}-${shortCommit}"
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortCommit}"
                 }
 
                 withCredentials([
@@ -52,8 +50,7 @@ pipeline {
                 }
 
                 script {
-                    env.REGISTRY =
-                        "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
                 }
 
                 echo "Release tag: ${env.IMAGE_TAG}"
@@ -66,14 +63,14 @@ pipeline {
                     set -eu
 
                     terraform fmt -check -recursive terraform
+
                     terraform -chdir=terraform init -backend=false
+
                     terraform -chdir=terraform validate
 
-                    export GRAFANA_ADMIN_PASSWORD=dummy-validation-value
+                    export GRAFANA_ADMIN_PASSWORD=validation-only
 
-                    docker compose \
-                      -f deploy/compose.yaml \
-                      config --quiet
+                    docker compose -f deploy/compose.yaml config --quiet
 
                     echo "Configuration validation passed"
                 '''
@@ -85,14 +82,22 @@ pipeline {
                 sh '''
                     set -eu
 
-                    for service in user product order
-                    do
-                        echo "Building $service service"
+                    echo "Building User service"
+                    docker build \
+                      -t "$ECR_REGISTRY/microdev-user:$IMAGE_TAG" \
+                      ./user-service
 
-                        docker build \
-                          -t "$REGISTRY/$PROJECT-$service:$IMAGE_TAG" \
-                          "./$service-service"
-                    done
+                    echo "Building Product service"
+                    docker build \
+                      -t "$ECR_REGISTRY/microdev-product:$IMAGE_TAG" \
+                      ./product-service
+
+                    echo "Building Order service"
+                    docker build \
+                      -t "$ECR_REGISTRY/microdev-order:$IMAGE_TAG" \
+                      ./order-service
+
+                    echo "All Docker images built successfully"
                 '''
             }
         }
@@ -102,17 +107,25 @@ pipeline {
                 sh '''
                     set -eu
 
-                    for service in user product order
-                    do
-                        echo "Testing $service service"
+                    echo "Testing User service"
+                    docker run --rm \
+                      --entrypoint python \
+                      "$ECR_REGISTRY/microdev-user:$IMAGE_TAG" \
+                      -m unittest discover -s /app/tests -v
 
-                        docker run --rm \
-                          --entrypoint python \
-                          "$REGISTRY/$PROJECT-$service:$IMAGE_TAG" \
-                          -m unittest discover \
-                          -s /app/tests \
-                          -v
-                    done
+                    echo "Testing Product service"
+                    docker run --rm \
+                      --entrypoint python \
+                      "$ECR_REGISTRY/microdev-product:$IMAGE_TAG" \
+                      -m unittest discover -s /app/tests -v
+
+                    echo "Testing Order service"
+                    docker run --rm \
+                      --entrypoint python \
+                      "$ECR_REGISTRY/microdev-order:$IMAGE_TAG" \
+                      -m unittest discover -s /app/tests -v
+
+                    echo "All application tests passed"
                 '''
             }
         }
@@ -127,22 +140,22 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        set +x
                         set -eu
 
                         aws ecr get-login-password \
                           --region "$AWS_REGION" |
-                        docker login \
-                          --username AWS \
-                          --password-stdin \
-                          "$REGISTRY"
+                          docker login \
+                            --username AWS \
+                            --password-stdin "$ECR_REGISTRY"
 
-                        for service in user product order
-                        do
-                            docker push \
-                              "$REGISTRY/$PROJECT-$service:$IMAGE_TAG"
-                        done
+                        docker push "$ECR_REGISTRY/microdev-user:$IMAGE_TAG"
+                        docker push "$ECR_REGISTRY/microdev-product:$IMAGE_TAG"
+                        docker push "$ECR_REGISTRY/microdev-order:$IMAGE_TAG"
 
-                        docker logout "$REGISTRY"
+                        docker logout "$ECR_REGISTRY"
+
+                        echo "All images pushed to Amazon ECR"
                     '''
                 }
             }
@@ -150,61 +163,65 @@ pipeline {
 
         stage('Deploy to EC2') {
             steps {
-                sshagent(credentials: ['ec2-ssh-key']) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-ecr-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ),
+                    string(
+                        credentialsId: 'grafana-admin-password',
+                        variable: 'GRAFANA_ADMIN_PASSWORD'
+                    )
+                ]) {
                     sh '''
+                        set +x
                         set -eu
+
+                        echo "Preparing local deployment directory"
+
+                        mkdir -p "$DEPLOY_DIR"
+                        chmod 700 "$DEPLOY_DIR"
+
+                        cp -a deploy/. "$DEPLOY_DIR/"
+
+                        cd "$DEPLOY_DIR"
+
+                        if [ -f .env ]; then
+                            cp .env .env.previous
+                        fi
+
                         umask 077
 
-                        printf 'AWS_ACCOUNT_ID=%s\\nAWS_REGION=%s\\nIMAGE_TAG=%s\\n' \
-                          "$AWS_ACCOUNT_ID" \
-                          "$AWS_REGION" \
-                          "$IMAGE_TAG" > deploy/.env
+                        printf '%s\\n' \
+                          "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" \
+                          "AWS_REGION=$AWS_REGION" \
+                          "IMAGE_TAG=$IMAGE_TAG" > .env
 
-                        REMOTE="ubuntu@$EC2_HOST"
+                        echo "Authenticating Docker with ECR"
 
-                        ssh -o BatchMode=yes "$REMOTE" \
-                          'mkdir -p /opt/microdev &&
-                           if [ -f /opt/microdev/.env ]; then
-                             cp /opt/microdev/.env /opt/microdev/.env.previous
-                           fi'
-
-                        scp -o BatchMode=yes \
-                          deploy/compose.yaml \
-                          deploy/nginx.conf \
-                          deploy/prometheus.yml \
-                          deploy/.env \
-                          "$REMOTE:/opt/microdev/"
-
-                        scp -o BatchMode=yes -r \
-                          deploy/grafana \
-                          "$REMOTE:/opt/microdev/"
-
-                        ssh -o BatchMode=yes "$REMOTE" '
-                          set -eu
-
-                          cd /opt/microdev
-                          chmod 600 .env
-
-                          ACCOUNT_ID=$(aws sts get-caller-identity \
-                            --query Account --output text)
-
-                          aws ecr get-login-password \
-                            --region ap-south-1 |
+                        aws ecr get-login-password \
+                          --region "$AWS_REGION" |
                           docker login \
                             --username AWS \
-                            --password-stdin \
-                            "$ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com"
+                            --password-stdin "$ECR_REGISTRY"
 
-                          docker compose \
-                            --env-file .env \
-                            --env-file .secrets.env \
-                            pull
+                        echo "Pulling Docker images"
 
-                          docker compose \
-                            --env-file .env \
-                            --env-file .secrets.env \
-                            up -d --remove-orphans
-                        '
+                        docker compose -f compose.yaml pull
+
+                        echo "Starting microservices and monitoring"
+
+                        docker compose -f compose.yaml \
+                          up -d --remove-orphans
+
+                        echo "Deployment container status"
+
+                        docker compose -f compose.yaml ps
+
+                        docker logout "$ECR_REGISTRY"
+
+                        echo "Local EC2 deployment completed"
                     '''
                 }
             }
@@ -212,59 +229,51 @@ pipeline {
 
         stage('Verify Deployment') {
             steps {
-                sshagent(credentials: ['ec2-ssh-key']) {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        ssh -o BatchMode=yes \
-                          "ubuntu@$EC2_HOST" '
-                          set -eu
+                    echo "Waiting for microservice health checks"
 
-                          cd /opt/microdev
+                    for attempt in $(seq 1 20); do
+                        if curl -fsS --max-time 5 \
+                             http://127.0.0.1/users/health \
+                             > /dev/null &&
+                           curl -fsS --max-time 5 \
+                             http://127.0.0.1/products/health \
+                             > /dev/null &&
+                           curl -fsS --max-time 5 \
+                             http://127.0.0.1/orders/health \
+                             > /dev/null
+                        then
+                            echo "All three microservices are healthy"
+                            exit 0
+                        fi
 
-                          for attempt in $(seq 1 30)
-                          do
-                            if curl -fsS http://127.0.0.1/users/health \
-                               >/dev/null &&
-                               curl -fsS http://127.0.0.1/products/health \
-                               >/dev/null &&
-                               curl -fsS http://127.0.0.1/orders/health \
-                               >/dev/null
-                            then
-                              echo "All microservices are healthy"
-                              exit 0
-                            fi
+                        echo "Health check attempt $attempt failed"
+                        sleep 3
+                    done
 
-                            echo "Waiting for services..."
-                            sleep 5
-                          done
-
-                          docker compose \
-                            --env-file .env \
-                            --env-file .secrets.env \
-                            ps
-
-                          exit 1
-                        '
-                    '''
-                }
+                    echo "Deployment health checks failed"
+                    exit 1
+                '''
             }
         }
     }
 
     post {
         success {
-            echo "CI/CD pipeline completed successfully."
-            echo "Deployed release: ${env.IMAGE_TAG}"
+            echo "CI/CD pipeline completed successfully"
+            echo "Release: ${env.IMAGE_TAG}"
         }
 
         failure {
-            echo "Pipeline failed. Review the failed stage."
-            echo "Previous release can be restored using .env.previous."
+            echo "Pipeline failed. Review the console output."
+            echo "Check containers using: docker ps -a"
+            echo "Previous release metadata is saved as .env.previous when available."
         }
 
         always {
-            cleanWs()
         }
     }
 }
+

@@ -22,7 +22,7 @@ def home():
 
     return jsonify({
         "service": SERVICE_NAME,
-        "message": "User Service Version-2 is running"
+        "message": "User Service Version-3 is running"
     })
 
 
